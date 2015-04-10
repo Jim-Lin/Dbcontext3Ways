@@ -28,8 +28,8 @@
         public void AddUsingExplicitDbContext(Company comp, User user)
         {
             CoreDbContext context = new CoreDbContext();
-            Dbcontext3Ways.DAL.Repo.Explicit.RepoCompany repoComp = new Dbcontext3Ways.DAL.Repo.Explicit.RepoCompany(context);
-            Dbcontext3Ways.DAL.Repo.Explicit.RepoUser repoUser = new Dbcontext3Ways.DAL.Repo.Explicit.RepoUser(context);
+            IRepoCompany repoComp = new Dbcontext3Ways.DAL.Repo.Explicit.RepoCompany(context);
+            IRepoUser repoUser = new Dbcontext3Ways.DAL.Repo.Explicit.RepoUser(context);
 
             repoComp.Insert(comp);
             user.Company = comp;

@@ -7,7 +7,7 @@
     using System.Threading.Tasks;
     using Dbcontext3Ways.EFModel;
 
-    class RepoCompany : GenericRepository<Company>
+    class RepoCompany : GenericRepository<Company>, IRepoCompany
     {
         public RepoCompany(CoreDbContext db) : base(db)
         { }

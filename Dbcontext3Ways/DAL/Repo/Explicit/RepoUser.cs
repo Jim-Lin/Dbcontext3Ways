@@ -7,7 +7,7 @@
     using System.Threading.Tasks;
     using Dbcontext3Ways.EFModel;
 
-    class RepoUser : GenericRepository<User>
+    class RepoUser : GenericRepository<User>, IRepoUser
     {
         public RepoUser(CoreDbContext db) : base(db)
         { }
