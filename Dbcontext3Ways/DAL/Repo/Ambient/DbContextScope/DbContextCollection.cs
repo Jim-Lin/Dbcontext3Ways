@@ -11,7 +11,7 @@
     /// <summary>
     /// Handle class for holding the real DbContext and some state for it.
     /// </summary>
-    class DbContextCollection : IDisposable
+    public class DbContextCollection : IDisposable
     {
         private Dictionary<Type, DbContext> initializedDbContexts;
 

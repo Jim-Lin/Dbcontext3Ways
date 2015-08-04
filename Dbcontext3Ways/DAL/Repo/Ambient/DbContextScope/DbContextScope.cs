@@ -9,7 +9,7 @@
     using System.Threading.Tasks;
 
     /// <summary>
-    /// Purpose of a UnitOfWorkScope.
+    /// Purpose of a DbContextScopePurpose.
     /// </summary>
     public enum DbContextScopePurpose
     {
@@ -29,14 +29,14 @@
     /// Scoped unit of work, that merges with any existing scoped unit of work
     /// activated by a previous function in the call chain.
     /// </summary>
-    class DbContextScope : IDisposable
+    public class DbContextScope : IDisposable
     {
         private static readonly string AmbientDbContextScopeKey = "AmbientDbcontext_" + Guid.NewGuid();
 
         private static readonly ConditionalWeakTable<InstanceIdentifier, DbContextScope> DbContextScopeInstances = new ConditionalWeakTable<InstanceIdentifier, DbContextScope>();
 
-        [ThreadStatic]
-        private static DbContextCollection scopedDbContexts;
+        // [ThreadStatic]
+        private DbContextCollection scopedDbContexts;
 
         private InstanceIdentifier instanceIdentifier = new InstanceIdentifier();
 
@@ -46,25 +46,34 @@
 
         private DbContextScopePurpose purpose;
 
+        private DbContextScope parentScope;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="DbContextScope" /> class.
         /// </summary>
         /// <param name="purpose">Will this dbcontext scope be used for reading or writing?</param>
-        public DbContextScope(DbContextScopePurpose purpose)
+        /// <param name="isNewScope">Will this dbcontext scope be a new DbContextScope.</param>
+        public DbContextScope(DbContextScopePurpose purpose, bool isNewScope = false)
         {
             this.purpose = purpose;
 
-            if (scopedDbContexts == null)
+            this.parentScope = GetAmbientScope();
+            if (this.parentScope != null && !isNewScope)
             {
-                scopedDbContexts = new DbContextCollection(purpose == DbContextScopePurpose.Writing);
-                this.SetAmbientScope(this);
+                this.scopedDbContexts = this.parentScope.DbContext;
+            }
+            else
+            {
+                this.scopedDbContexts = new DbContextCollection(purpose == DbContextScopePurpose.Writing);
                 this.isRoot = true;
             }
 
-            if (purpose == DbContextScopePurpose.Writing && !scopedDbContexts.ForWriting)
+            this.SetAmbientScope(this);
+
+            if (purpose == DbContextScopePurpose.Writing && !this.scopedDbContexts.ForWriting)
             {
                 throw new InvalidOperationException(
-                    "Can't open a child UnitOfWorkScope for writing when the root scope " +
+                    "Can't open a child DbContextScope for writing when the root scope " +
                     "is opened for reading.");
             }
         }
@@ -76,7 +85,7 @@
         {
             get
             {
-                return scopedDbContexts;
+                return this.scopedDbContexts;
             }
         }
 
@@ -124,7 +133,7 @@
                     "Can't save changes on a UnitOfWorkScope with Reading purpose.");
             }
 
-            if (scopedDbContexts.BlockSave)
+            if (this.scopedDbContexts.BlockSave)
             {
                 throw new InvalidOperationException(
                     "Saving of changes is blocked for this unit of work scope. An enclosed " +
@@ -138,15 +147,99 @@
                 return;
             }
 
-            scopedDbContexts.AllowSaving = true;
-            scopedDbContexts.SaveChanges();
-            scopedDbContexts.AllowSaving = false;
+            this.scopedDbContexts.AllowSaving = true;
+            this.scopedDbContexts.SaveChanges();
+            this.scopedDbContexts.AllowSaving = false;
         }
 
         public void Dispose()
         {
-            this.Dispose(true);
-            GC.SuppressFinalize(this);
+            if (this.isRoot)
+            {
+                this.Dispose(true);
+                GC.SuppressFinalize(this);
+            }
+
+            // Pop ourself from the ambient scope stack
+            var currentAmbientScope = GetAmbientScope();
+            if (currentAmbientScope != this)
+            {
+                // This is a serious programming error. Worth throwing here.
+                throw new InvalidOperationException("DbContextScope instances must be disposed of in the order in which they were created!");
+            }
+
+            RemoveAmbientScope();
+
+            if (this.parentScope != null)
+            {
+                if (this.parentScope.DbContext == null)
+                {
+                    /*
+                     * If our parent scope has been disposed before us, it can only mean one thing:
+                     * someone started a parallel flow of execution and forgot to suppress the
+                     * ambient context before doing so. And we've been created in that parallel flow.
+                     * 
+                     * Since the CallContext flows through all async points, the ambient scope in the 
+                     * main flow of execution ended up becoming the ambient scope in this parallel flow
+                     * of execution as well. So when we were created, we captured it as our "parent scope". 
+                     * 
+                     * The main flow of execution then completed while our flow was still ongoing. When 
+                     * the main flow of execution completed, the ambient scope there (which we think is our 
+                     * parent scope) got disposed of as it should.
+                     * 
+                     * So here we are: our parent scope isn't actually our parent scope. It was the ambient
+                     * scope in the main flow of execution from which we branched off. We should never have seen 
+                     * it. Whoever wrote the code that created this parallel task should have suppressed
+                     * the ambient context before creating the task - that way we wouldn't have captured
+                     * this bogus parent scope.
+                     * 
+                     * While this is definitely a programming error, it's not worth throwing here. We can only 
+                     * be in one of two scenario:
+                     * 
+                     * - If the developer who created the parallel task was mindful to force the creation of 
+                     * a new scope in the parallel task (with IDbContextScopeFactory.CreateNew() instead of 
+                     * JoinOrCreate()) then no harm has been done. We haven't tried to access the same DbContext
+                     * instance from multiple threads.
+                     * 
+                     * - If this was not the case, they probably already got an exception complaining about the same
+                     * DbContext or ObjectContext being accessed from multiple threads simultaneously (or a related
+                     * error like multiple active result sets on a DataReader, which is caused by attempting to execute
+                     * several queries in parallel on the same DbContext instance). So the code has already blow up.
+                     * 
+                     * So just record a warning here. Hopefully someone will see it and will fix the code.
+                     */
+
+                    var message = @"PROGRAMMING ERROR - When attempting to dispose a DbContextScope, we found that our parent DbContextScope has already been disposed! This means that someone started a parallel flow of execution (e.g. created a TPL task, created a thread or enqueued a work item on the ThreadPool) within the context of a DbContextScope without suppressing the ambient context first. 
+
+In order to fix this:
+1) Look at the stack trace below - this is the stack trace of the parallel task in question.
+2) Find out where this parallel task was created.
+3) Change the code so that the ambient context is suppressed before the parallel task is created. You can do this with IDbContextScopeFactory.SuppressAmbientContext() (wrap the parallel task creation code block in this). 
+
+Stack Trace:
+" + Environment.StackTrace;
+                }
+                else
+                {
+                    this.SetAmbientScope(this.parentScope);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Clears the ambient scope from the CallContext and stops tracking its instance. 
+        /// Call this when a DbContextScope is being disposed.
+        /// </summary>
+        internal static void RemoveAmbientScope()
+        {
+            var current = CallContext.LogicalGetData(AmbientDbContextScopeKey) as InstanceIdentifier;
+            CallContext.LogicalSetData(AmbientDbContextScopeKey, null);
+
+            // If there was an ambient scope, we can stop tracking it now
+            if (current != null)
+            {
+                DbContextScopeInstances.Remove(current);
+            }
         }
 
         /// <summary>
@@ -162,16 +255,16 @@
                 // of the entire unit of work.
                 if (this.purpose == DbContextScopePurpose.Writing && !this.saveChangesCalled)
                 {
-                    scopedDbContexts.BlockSave = true;
+                    this.scopedDbContexts.BlockSave = true;
 
                     // Don't throw here - it would mask original exception when exiting
                     // a using block.
                 }
 
-                if (scopedDbContexts != null && this.isRoot)
+                if (this.scopedDbContexts != null && this.isRoot)
                 {
-                    scopedDbContexts.Dispose();
-                    scopedDbContexts = null;
+                    this.scopedDbContexts.Dispose();
+                    this.scopedDbContexts = null;
                 }
             }
         }
